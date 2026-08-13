@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# local run artifacts
+live_test/*.log
+live_test/prompts.log
+*.zip
+
+# never commit credentials or tokens
+.hyperagent-harness/
+tokens.json
+.env
