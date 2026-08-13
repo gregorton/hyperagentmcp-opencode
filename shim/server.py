@@ -27,12 +27,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from concurrent.futures import TimeoutError as FutureTimeout
 
 from .bridge import (
-    SSEWriter, ThreadMap, build_delta, build_opening, completion_response,
-    estimate_usage, looks_like_tool_json, parse_reply, stream_chunks,
+    SSEWriter, ThreadMap, _sig, build_delta, build_opening, completion_response,
+    estimate_usage, local_title, looks_like_tool_json, parse_reply, stream_chunks,
 )
 from .hyperagent_client import HyperagentClient
 
-STATE: dict = {"client": None, "loop": None, "agents": [], "threads": ThreadMap(), "debug": False}
+STATE: dict = {"client": None, "loop": None, "agents": [], "threads": ThreadMap(), "debug": False,
+               "pending": {}, "plock": threading.Lock()}
 
 # A turn is a full agent run, so keep the HTTP connection warm while waiting.
 HEARTBEAT_SECONDS = 5.0
@@ -83,33 +84,90 @@ def resolve_agent_id(model: str) -> str:
     raise RuntimeError(f"no Hyperagent agent matches model {model!r}")
 
 
+def _local_titles_enabled() -> bool:
+    return os.environ.get("HYPERAGENT_LOCAL_TITLES", "1").lower() not in ("0", "false", "no")
+
+
 def begin_completion(body: dict) -> dict:
-    """Fast half: pick the agent, start or continue the thread. No waiting."""
+    """Fast half: pick the agent, start or continue the thread. No waiting.
+
+    Duplicate-safe: opencode (and flaky networks) can fire the same request
+    twice. We coalesce concurrent duplicates onto one in-flight turn, and never
+    resend a conversation we've already delivered.
+    """
     messages = body.get("messages") or []
     model = body.get("model") or "hyperagent"
     agent_id = resolve_agent_id(model)
     client, threads = STATE["client"], STATE["threads"]
 
-    thread_id, new_messages = threads.lookup(messages)
+    key = _sig(messages)
+    mode = None
+    entry = None
+    thread_id = None
+    new_messages = messages
 
-    if thread_id is None:
-        prompt = build_opening(messages, body.get("tools"), body.get("tool_choice"))
-        if STATE["debug"]:
-            print(f"\n[shim] NEW thread on {agent_id}, prompt {len(prompt)} chars", file=sys.stderr)
-        thread_id = run_async(client.create_thread(agent_id, prompt))
-    else:
-        prompt = build_delta(new_messages, body.get("tool_choice"))
-        if STATE["debug"]:
-            print(f"\n[shim] reuse thread {thread_id}, delta {len(new_messages)} msg(s)", file=sys.stderr)
-        run_async(client.send_message(thread_id, prompt))
+    with STATE["plock"]:
+        existing = STATE["pending"].get(key)
+        if existing is not None:
+            mode, entry = "attach", existing
+        elif (known := threads.lookup_exact(messages)) is not None:
+            mode, thread_id = "rewait", known
+        else:
+            mode = "own"
+            thread_id, new_messages = threads.lookup(messages)
+            entry = {"ready": threading.Event(), "thread_id": None, "future": None, "error": None}
+            STATE["pending"][key] = entry
 
-    return {"thread_id": thread_id, "messages": messages, "model": model, "prompt": prompt}
+    if mode == "own":
+        try:
+            if thread_id is None:
+                prompt = build_opening(messages, body.get("tools"), body.get("tool_choice"))
+                if STATE["debug"]:
+                    print(f"\n[shim] NEW thread on {agent_id}, prompt {len(prompt)} chars", file=sys.stderr)
+                thread_id = run_async(client.create_thread(agent_id, prompt))
+            else:
+                prompt = build_delta(new_messages, body.get("tool_choice"))
+                if STATE["debug"]:
+                    print(f"\n[shim] reuse thread {thread_id}, delta {len(new_messages)} msg(s)", file=sys.stderr)
+                run_async(client.send_message(thread_id, prompt))
+            # early record so a post-crash retry rewaits instead of resending
+            threads.record(messages, thread_id)
+            entry["thread_id"] = thread_id
+            entry["future"] = asyncio.run_coroutine_threadsafe(
+                client.wait_for_reply(thread_id), STATE["loop"])
+            entry["ready"].set()
+        except Exception as e:  # noqa: BLE001
+            entry["error"] = e
+            entry["ready"].set()
+            with STATE["plock"]:
+                STATE["pending"].pop(key, None)
+            raise
+        future = entry["future"]
+    elif mode == "attach":
+        if STATE["debug"]:
+            print("[shim] duplicate request attached to in-flight turn", file=sys.stderr)
+        entry["ready"].wait(timeout=1800)
+        if entry["error"] is not None:
+            raise RuntimeError(f"in-flight duplicate failed: {entry['error']}")
+        thread_id = entry["thread_id"]
+        future = entry["future"]
+        prompt = ""
+    else:  # rewait
+        if STATE["debug"]:
+            print("[shim] known conversation, waiting again without resending", file=sys.stderr)
+        future = asyncio.run_coroutine_threadsafe(client.wait_for_reply(thread_id), STATE["loop"])
+        prompt = ""
+
+    return {"thread_id": thread_id, "messages": messages, "model": model,
+            "prompt": prompt, "key": key, "future": future}
 
 
 def finalize_completion(ctx: dict, reply: str) -> tuple:
     """Slow half's aftermath: parse, remember the turn, estimate usage."""
     threads = STATE["threads"]
     messages, thread_id = ctx["messages"], ctx["thread_id"]
+    with STATE["plock"]:
+        STATE["pending"].pop(ctx["key"], None)
     threads.record(messages, thread_id)
 
     parsed = parse_reply(reply)
@@ -127,8 +185,15 @@ def finalize_completion(ctx: dict, reply: str) -> tuple:
 
 def handle_completion(body: dict) -> tuple:
     """Blocking round trip, for the non-streaming path."""
+    messages = body.get("messages") or []
+    if _local_titles_enabled() and (title := local_title(messages)) is not None:
+        if STATE["debug"]:
+            print("[shim] title request answered locally", file=sys.stderr)
+        parsed = parse_reply(title)
+        return parsed, body.get("model") or "hyperagent", estimate_usage(0, parsed)
+
     ctx = begin_completion(body)
-    reply = run_async(STATE["client"].wait_for_reply(ctx["thread_id"]))
+    reply = ctx["future"].result(timeout=1800)
     parsed, usage = finalize_completion(ctx, reply)
     return parsed, ctx["model"], usage
 
@@ -141,13 +206,25 @@ def stream_completion(body: dict):
     meanwhile. With HYPERAGENT_PARTIAL_STREAM=1 the shim also polls for text
     the agent has produced so far and forwards it as real deltas.
     """
+    messages = body.get("messages") or []
+    if _local_titles_enabled() and (title := local_title(messages)) is not None:
+        if STATE["debug"]:
+            print("[shim] title request answered locally", file=sys.stderr)
+        writer = SSEWriter(body.get("model") or "hyperagent")
+        parsed = parse_reply(title)
+        yield writer.role()
+        yield writer.text(title)
+        yield writer.finish("stop", estimate_usage(0, parsed))
+        yield writer.done()
+        return
+
     ctx = begin_completion(body)
     writer = SSEWriter(ctx["model"])
     client, thread_id = STATE["client"], ctx["thread_id"]
 
     yield writer.role()
 
-    future = asyncio.run_coroutine_threadsafe(client.wait_for_reply(thread_id), STATE["loop"])
+    future = ctx["future"]
     streamed = ""
     reply = None
 

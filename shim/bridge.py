@@ -246,6 +246,54 @@ class ThreadMap:
     def record(self, messages: list[dict], thread_id: str) -> None:
         self._remember(messages, thread_id)
 
+    def lookup_exact(self, messages: list[dict]) -> str | None:
+        return self._map.get(_sig(messages))
+
+
+# --------------------------------------------------------------------------
+# Local title answering
+# --------------------------------------------------------------------------
+
+TITLE_MARKER = "You are a title generator. You output ONLY a thread title."
+
+
+def _text_of(content) -> str:
+    """Flatten OpenAI content (str or list of typed parts) to plain text."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for p in content:
+            if isinstance(p, dict) and p.get("type") == "text":
+                parts.append(p.get("text", ""))
+        return "\n".join(parts)
+    return ""
+
+
+def local_title(messages: list[dict]) -> str | None:
+    """Answer opencode's title-generation request locally, without an agent call."""
+    try:
+        matched = any(
+            m.get("role") == "system" and TITLE_MARKER in _text_of(m.get("content"))
+            for m in messages
+        )
+        if not matched:
+            return None
+        user_text = ""
+        for m in reversed(messages):
+            if m.get("role") == "user":
+                user_text = _text_of(m.get("content"))
+                break
+        first = ""
+        for line in user_text.splitlines():
+            if line.strip():
+                first = line
+                break
+        title = re.sub(r"\s+", " ", first).strip()[:50]
+        return title or "opencode session"
+    except Exception:
+        return "opencode session"
+
 
 # --------------------------------------------------------------------------
 # OpenAI response envelopes
