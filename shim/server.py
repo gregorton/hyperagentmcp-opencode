@@ -23,6 +23,7 @@ import sys
 import threading
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 from concurrent.futures import TimeoutError as FutureTimeout
 
@@ -141,6 +142,10 @@ def begin_completion(body: dict) -> dict:
             entry["ready"].set()
             with STATE["plock"]:
                 STATE["pending"].pop(key, None)
+            if thread_id is not None:
+                threads.forget_thread(thread_id)
+                if STATE["debug"]:
+                    print("[shim] purged stale thread mapping", file=sys.stderr)
             raise
         future = entry["future"]
     elif mode == "attach":
@@ -380,6 +385,10 @@ def main() -> None:
     ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
     STATE["debug"] = args.debug
+
+    state_dir = Path(os.environ.get("HYPERAGENT_STATE_DIR") or Path.home() / ".hyperagent-opencode")
+    STATE["threads"] = ThreadMap(path=state_dir / "threads.json")
+    print(f"Thread memory: {state_dir / 'threads.json'}")
 
     print("Connecting to Hyperagent MCP (a browser may open for sign-in)...")
     start_mcp_loop(args.debug)

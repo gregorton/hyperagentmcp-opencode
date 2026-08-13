@@ -15,10 +15,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 
 PROTOCOL = """\
 === OUTPUT PROTOCOL (read carefully) ===
@@ -217,20 +220,56 @@ class ThreadMap:
 
     opencode resends the entire history each request. Rather than replaying it,
     we look up the longest known prefix and send only what's new.
+
+    The map can persist to disk so restarts keep continuing existing threads;
+    the file holds only sha256 fingerprints and thread ids, never message content.
     """
 
-    def __init__(self, max_entries: int = 200):
+    def __init__(self, max_entries: int = 500, path: Path | None = None):
         self._map: dict[str, str] = {}
         self._order: list[str] = []
         self.max_entries = max_entries
+        self.path = Path(path) if path else None
+        self._lock = threading.Lock()
+        if self.path is not None:
+            self._load()
+
+    def _load(self) -> None:
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return
+        if not isinstance(data, dict) or data.get("v") != 1:
+            return
+        loaded_map = data.get("map")
+        loaded_order = data.get("order")
+        if not isinstance(loaded_map, dict) or not isinstance(loaded_order, list):
+            return
+        self._map = {k: v for k, v in loaded_map.items()}
+        self._order = [k for k in loaded_order if k in self._map]
+
+    def _save(self) -> None:
+        if self.path is None:
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"v": 1, "order": self._order, "map": self._map}, f)
+            os.replace(tmp, self.path)
+        except OSError:
+            pass
 
     def _remember(self, messages: list[dict], thread_id: str) -> None:
-        key = _sig(messages)
-        if key not in self._map:
-            self._order.append(key)
-        self._map[key] = thread_id
-        while len(self._order) > self.max_entries:
-            self._map.pop(self._order.pop(0), None)
+        with self._lock:
+            key = _sig(messages)
+            if key not in self._map:
+                self._order.append(key)
+            self._map[key] = thread_id
+            while len(self._order) > self.max_entries:
+                self._map.pop(self._order.pop(0), None)
+            self._save()
 
     def lookup(self, messages: list[dict], max_lookback: int = 6):
         """Return (thread_id, new_messages) or (None, all_messages)."""
@@ -238,7 +277,8 @@ class ThreadMap:
             prefix = messages[:-back]
             if not prefix:
                 break
-            tid = self._map.get(_sig(prefix))
+            with self._lock:
+                tid = self._map.get(_sig(prefix))
             if tid:
                 return tid, messages[-back:]
         return None, messages
@@ -247,7 +287,16 @@ class ThreadMap:
         self._remember(messages, thread_id)
 
     def lookup_exact(self, messages: list[dict]) -> str | None:
-        return self._map.get(_sig(messages))
+        with self._lock:
+            return self._map.get(_sig(messages))
+
+    def forget_thread(self, thread_id: str) -> None:
+        with self._lock:
+            keys = [k for k, v in self._map.items() if v == thread_id]
+            for k in keys:
+                self._map.pop(k, None)
+            self._order = [k for k in self._order if k not in keys]
+            self._save()
 
 
 # --------------------------------------------------------------------------
