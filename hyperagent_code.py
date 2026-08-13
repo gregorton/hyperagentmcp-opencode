@@ -5,6 +5,8 @@
     python hyperagent_code.py run      # start the shim and launch opencode
     python hyperagent_code.py serve    # just the shim (run opencode yourself)
 
+A bare invocation (no subcommand) defaults to `run`, so a global `hypercode` launcher works from any folder.
+
 `setup` backs up any existing opencode config before writing.
 """
 
@@ -170,6 +172,20 @@ def cmd_run(args) -> None:
         print("\nShim stopped.")
 
 
+def normalize_argv(argv: list[str]) -> list[str]:
+    """Default to the `run` subcommand so a bare `hypercode` just works."""
+    known = {"setup", "serve", "run"}
+    if argv and argv[0] == "--debug":
+        flags, rest = ["--debug"], argv[1:]
+    else:
+        flags, rest = [], argv
+    if not rest:
+        rest = ["run"]
+    elif rest[0] not in known and rest[0] not in ("-h", "--help"):
+        rest = ["run"] + rest
+    return flags + rest
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--debug", action="store_true", help="verbose shim logging")
@@ -182,7 +198,7 @@ def main() -> None:
     run.add_argument("opencode_args", nargs=argparse.REMAINDER,
                      help="arguments passed straight through to opencode")
     run.set_defaults(func=cmd_run)
-    args = ap.parse_args()
+    args = ap.parse_args(normalize_argv(sys.argv[1:]))
     args.func(args)
 
 

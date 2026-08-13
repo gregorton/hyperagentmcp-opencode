@@ -9,6 +9,8 @@ location. After that, `hypercode` works in any project directory:
 
     cd C:\\projects\\anything
     hypercode
+    hypercode setup      # re-discover agents (new agent added, etc.)
+    hypercode serve      # just the shim
 
 Nothing about your setup is per-project. Sign-in and config are stored in your
 home directory, so this only saves you typing.
@@ -61,9 +63,9 @@ def launcher_path(bin_dir: Path) -> Path:
 def write_launcher(bin_dir: Path) -> Path:
     path = launcher_path(bin_dir)
     if IS_WINDOWS:
-        body = f'@echo off\r\n"{sys.executable}" "{TARGET}" run %*\r\n'
+        body = f'@echo off\r\n"{sys.executable}" "{TARGET}" %*\r\n'
     else:
-        body = f'#!/usr/bin/env bash\nexec "{sys.executable}" "{TARGET}" run "$@"\n'
+        body = f'#!/usr/bin/env bash\nexec "{sys.executable}" "{TARGET}" "$@"\n'
     path.write_text(body)
     if not IS_WINDOWS:
         path.chmod(0o755)
